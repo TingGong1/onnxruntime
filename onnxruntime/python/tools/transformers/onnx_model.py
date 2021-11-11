@@ -864,7 +864,7 @@ class OnnxModel:
         #    self.graph_topological_sort(graph)
         OnnxModel.graph_topological_sort(self.model.graph)
 
-    def save_model_to_file(self, output_path, use_external_data_format=False, all_tensors_to_one_file=True):
+    def save_model_to_file(self, output_path, use_external_data_format=False, all_tensors_to_one_file=False):
         logger.info(f"Sort graphs in topological order")
         self.topological_sort()
 

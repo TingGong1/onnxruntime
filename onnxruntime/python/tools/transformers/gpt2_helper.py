@@ -419,7 +419,12 @@ class Gpt2Helper:
             op_block_list = set(kwargs["op_block_list"]) if "op_block_list" in kwargs else set()
             op_remain_list = op_full_list.difference(op_block_list)
             logger.info(f"op_block_list={op_block_list} op_remain_list={op_remain_list}")
-            m.convert_float_to_float16(use_symbolic_shape_infer=True, **kwargs)
+            m.convert_float_to_float16(
+                    keep_io_types=["input_log_probs", "prev_step_scores", "output_log_probs", "current_step_scores"],                                              # the graph output of softmax will be in FP32
+                    op_block_list= ["Add", "FastGelu", "LayerNormalization", "Softmax"],  # Operators in FP32
+                    force_fp16_initializers=False,                                                 # Weights in FP16
+                    min_positive_val=5.96e-08,                                                  # Constant
+                    max_finite_val=float(numpy.finfo(numpy.float16).max))      # Constan)
 
         m.save_model_to_file(optimized_model_path, use_external_data_format)
 

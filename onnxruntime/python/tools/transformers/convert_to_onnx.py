@@ -26,7 +26,7 @@ from pathlib import Path
 from packaging import version
 from transformers import AutoConfig
 from gpt2_helper import DEFAULT_TOLERANCE, PRETRAINED_GPT2_MODELS
-from gpt2_beamsearch_helper import Gpt2HelperFactory, MODEL_CLASSES
+from gpt2_beamsearch_helper import Gpt2HelperFactory, MODEL_CLASSES,Gpt2BeamSearchHelper
 from gpt2_beamsearch_tester import Gpt2TesterFactory
 from quantize_helper import QuantizeHelper
 from benchmark_helper import create_onnxruntime_session, setup_logger, prepare_environment, Precision
@@ -149,6 +149,18 @@ def parse_arguments(argv=None):
                                        default=0.95,
                                        help='Nuclear/top-p sampling accumulation probability.')
     sampling_option_group.add_argument('--do_sample_top_k', type=int, default=0, help='Use top-k if non-zero.')
+    
+    search_option_group.add_argument('--pad_token_id',
+                                     required=False,
+                                     nargs='+',
+                                     type=float,
+                                     help='A list of token ids to be padded in the sampe.')
+
+    search_option_group.add_argument('--eos_token_id',
+                                     required=False,
+                                     nargs='+',
+                                     type=float,
+                                     help='A list of token ids to be padded in the sampe.')
 
     fp16_option_group = parser.add_argument_group(
         "float to float16 conversion parameters that works when \"--precision fp16\" is specified")
@@ -266,7 +278,9 @@ def main(argv=None, experiment_name="", run_id=0, csv_filename="gpt2_parity_resu
                                             do_sample=args.do_sample,
                                             do_sample_top_p=args.do_sample_top_p,
                                             do_sample_top_k=args.do_sample_top_k,
-                                            cache_dir=cache_dir)
+                                            cache_dir=cache_dir,
+                                            pad_token_id=args.pad_token_id,
+                                            eos_token_id=args.eos_token_id)
     else:
         model = model_class.from_pretrained(args.model_name_or_path, config=config, cache_dir=cache_dir)
 
@@ -335,84 +349,87 @@ def main(argv=None, experiment_name="", run_id=0, csv_filename="gpt2_parity_resu
     model_size_in_MB = int(get_onnx_model_size(output_path, args.use_external_data_format) / 1024 / 1024)
 
     session = create_onnxruntime_session(output_path, args.use_gpu, enable_all_optimization=True, verbose=args.verbose)
-    if args.model_class == "GPT2LMHeadModel" and session is not None:
-        parity_result = gpt2helper.test_parity(session,
+    if args.model_class == "GPT2LMHeadModel_ConfigurableOneStepSearch" and session is not None:
+        parity_result = Gpt2BeamSearchHelper.test_parity(session,
                                                model,
                                                device,
                                                is_io_float16,
                                                rtol=args.tolerance,
                                                atol=args.tolerance,
+                                               total_test_cases=100,
+                                               use_io_binding=True,
                                                model_class=args.model_class,
                                                has_position_ids=use_padding,
-                                               has_attention_mask=use_padding,
-                                               test_cases_per_run=args.test_cases,
-                                               total_runs=args.test_runs,
-                                               verbose=args.verbose)
+                                               has_attention_mask=use_padding)
+                                               #test_cases_per_run=args.test_cases,
+                                               #total_runs=args.test_runs,
+                                               #verbose=args.verbose)
+        logger.info(f"parity_result: {parity_result}")
 
-        latency = gpt2helper.test_performance(session,
-                                              model,
-                                              device,
-                                              is_io_float16,
-                                              total_runs=100,
-                                              use_io_binding=True,
-                                              model_class=args.model_class,
-                                              has_position_ids=use_padding,
-                                              has_attention_mask=use_padding,
-                                              batch_size=8,
-                                              sequence_length=1,
-                                              past_sequence_length=32)
+        # latency = gpt2helper.test_performance(session,
+        #                                       model,
+        #                                       device,
+        #                                       is_io_float16,
+        #                                       total_runs=100,
+        #                                       use_io_binding=True,
+        #                                       model_class=args.model_class,
+        #                                       has_position_ids=use_padding,
+        #                                       has_attention_mask=use_padding,
+        #                                       batch_size=8,
+        #                                       sequence_length=1,
+        #                                       past_sequence_length=32)
 
         if args.precision == Precision.FLOAT16:
             logger.info(f"fp16 conversion parameters:{fp16_params}")
 
-        # Write results to file
-        import csv
-        from onnxruntime import __version__ as ort_version
-        latency_name = get_latency_name()
-        csv_file_existed = os.path.exists(csv_filename)
-        with open(csv_filename, mode="a", newline='') as csv_file:
-            column_names = [
-                "experiment", "run_id", "model_name", "model_class", "gpu", "precision", "optimizer", "test_cases",
-                "runs", "keep_io_types", "io_block_list", "op_block_list", "node_block_list", "force_fp16_initializers",
-                "ORT_TRANSFORMER_OPTIONS", "ORT_CUDA_GEMM_OPTIONS", "onnxruntime", latency_name, "top1_match_rate",
-                "onnx_size_in_MB", "diff_50_percentile", "diff_90_percentile", "diff_95_percentile",
-                "diff_99_percentile", "diff_pass_rate", "nan_rate", "top1_match_rate_per_run"
-            ]
-            csv_writer = csv.DictWriter(csv_file, fieldnames=column_names)
-            if not csv_file_existed:
-                csv_writer.writeheader()
-            row = {
-                "experiment": experiment_name,
-                "run_id": run_id,
-                "model_name": args.model_name_or_path,
-                "model_class": args.model_class,
-                "gpu": args.use_gpu,
-                "precision": args.precision,
-                "optimizer": args.optimize_onnx,
-                "test_cases": args.test_cases,
-                "runs": args.test_runs,
-                "keep_io_types": args.keep_io_types,
-                "io_block_list": args.io_block_list,
-                "op_block_list": args.op_block_list,
-                "node_block_list": args.node_block_list,
-                "force_fp16_initializers": args.force_fp16_initializers,
-                "ORT_TRANSFORMER_OPTIONS": os.getenv('ORT_TRANSFORMER_OPTIONS'),
-                "ORT_CUDA_GEMM_OPTIONS": os.getenv('ORT_CUDA_GEMM_OPTIONS'),
-                "onnxruntime": ort_version,
-                latency_name: f"{latency:.2f}",
-                "diff_50_percentile": parity_result["max_diff_percentile_50"],
-                "diff_90_percentile": parity_result["max_diff_percentile_90"],
-                "diff_95_percentile": parity_result["max_diff_percentile_95"],
-                "diff_99_percentile": parity_result["max_diff_percentile_99"],
-                "diff_pass_rate": parity_result["diff_pass_rate"],
-                "nan_rate": parity_result["nan_rate"],
-                "top1_match_rate": parity_result["top1_match_rate"],
-                "top1_match_rate_per_run": parity_result["top1_match_rate_per_run"],
-                "onnx_size_in_MB": "{}".format(model_size_in_MB),
-            }
-            logger.info(f"result: {row}")
-            result.update(row)
-            csv_writer.writerow(row)
+        # # Write results to file
+        # import csv
+        # from onnxruntime import __version__ as ort_version
+        # latency_name = get_latency_name()
+        # csv_file_existed = os.path.exists(csv_filename)
+        # with open(csv_filename, mode="a", newline='') as csv_file:
+        #     column_names = [
+        #         "experiment", "run_id", "model_name", "model_class", "gpu", "precision", "optimizer", "test_cases",
+        #         "runs", "keep_io_types", "io_block_list", "op_block_list", "node_block_list", "force_fp16_initializers",
+        #         "ORT_TRANSFORMER_OPTIONS", "ORT_CUDA_GEMM_OPTIONS", "onnxruntime", latency_name, "top1_match_rate",
+        #         "onnx_size_in_MB", "diff_50_percentile", "diff_90_percentile", "diff_95_percentile",
+        #         "diff_99_percentile", "diff_pass_rate", "nan_rate", "top1_match_rate_per_run"
+        #     ]
+        #     csv_writer = csv.DictWriter(csv_file, fieldnames=column_names)
+        #     if not csv_file_existed:
+        #         csv_writer.writeheader()
+        #     row = {
+        #         "experiment": experiment_name,
+        #         "run_id": run_id,
+        #         "model_name": args.model_name_or_path,
+        #         "model_class": args.model_class,
+        #         "gpu": args.use_gpu,
+        #         "precision": args.precision,
+        #         "optimizer": args.optimize_onnx,
+        #         "test_cases": args.test_cases,
+        #         "runs": args.test_runs,
+        #         "keep_io_types": args.keep_io_types,
+        #         "io_block_list": args.io_block_list,
+        #         "op_block_list": args.op_block_list,
+        #         "node_block_list": args.node_block_list,
+        #         "force_fp16_initializers": args.force_fp16_initializers,
+        #         "ORT_TRANSFORMER_OPTIONS": os.getenv('ORT_TRANSFORMER_OPTIONS'),
+        #         "ORT_CUDA_GEMM_OPTIONS": os.getenv('ORT_CUDA_GEMM_OPTIONS'),
+        #         "onnxruntime": ort_version,
+        #         latency_name: f"{latency:.2f}",
+        #         "diff_50_percentile": parity_result["max_diff_percentile_50"],
+        #         "diff_90_percentile": parity_result["max_diff_percentile_90"],
+        #         "diff_95_percentile": parity_result["max_diff_percentile_95"],
+        #         "diff_99_percentile": parity_result["max_diff_percentile_99"],
+        #         "diff_pass_rate": parity_result["diff_pass_rate"],
+        #         "nan_rate": parity_result["nan_rate"],
+        #         "top1_match_rate": parity_result["top1_match_rate"],
+        #         "top1_match_rate_per_run": parity_result["top1_match_rate_per_run"],
+        #         "onnx_size_in_MB": "{}".format(model_size_in_MB),
+        #     }
+        #     logger.info(f"result: {row}")
+        #     result.update(row)
+        #     csv_writer.writerow(row)
 
     if args.input_test_file:
         test_inputs = []
